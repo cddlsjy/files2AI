@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-项目代码处理器（最终版）
-- 输出文件名为 <项目名>-AI.txt
+项目代码处理器（Android XML 优化版 - 防覆盖增强）
+- 输出文件名为 <项目名>-AI.txt，若已存在则自动添加序号（如 _01, _02...）
 - 输入输出目录自动同步
-- 代码、JSON、PDF、Word 分别控制，默认仅代码勾选
+- 代码、XML、PDF、Word 分别控制，默认仅代码勾选
+- XML 支持三种提取模式：默认、Layout 模式、全部模式
 - 自定义扩展名（逗号分隔）自动处理
 - 自动处理与记忆功能
 """
@@ -46,7 +47,7 @@ CODE_EXTENSIONS = {
     '.java', '.kt', '.kts', '.ets', '.c', '.h', '.cpp', '.cc', '.cxx', '.hpp', '.hxx',
     '.py', '.js', '.ts', '.go', '.rs', '.swift', '.rb', '.php', '.sql'
 }
-JSON_EXTENSIONS = {'.json'}
+XML_EXTENSIONS = {'.xml'}
 PDF_EXTENSIONS = {'.pdf'}
 WORD_EXTENSIONS = {'.doc', '.docx'}
 
@@ -89,6 +90,21 @@ class SplitFileWriter:
     def close(self):
         if self.current_file:
             self.current_file.close()
+
+def get_unique_filepath(filepath):
+    """
+    若文件已存在，返回带序号的新路径，如 file_01.txt, file_02.txt ...
+    同时避免与已有分卷文件产生潜在冲突（只检查主文件是否存在）。
+    """
+    if not os.path.exists(filepath):
+        return filepath
+    base, ext = os.path.splitext(filepath)
+    counter = 1
+    while True:
+        new_path = f"{base}_{counter:02d}{ext}"
+        if not os.path.exists(new_path):
+            return new_path
+        counter += 1
 
 def get_tree_structure(file_list):
     """从文件列表生成目录树"""
@@ -176,7 +192,34 @@ def extract_word_text(doc_path, use_ocr=False):
     else:
         return "[python-docx未安装，无法处理Word文件]\n"
 
-def process_input(input_path, output_dir, max_bytes, process_code, process_json, process_pdf, process_word, use_ocr, custom_exts, log_callback, progress_callback, stop_flag):
+# ---------- XML 模式判断函数 ----------
+def is_default_xml(path):
+    """判断是否为默认的两个关键 XML 文件（不区分大小写）"""
+    path_lower = path.lower()
+    if path_lower.endswith('androidmanifest.xml'):
+        return True
+    if path_lower.endswith('activity_main.xml'):
+        return True
+    return False
+
+def is_layout_xml(path):
+    """判断是否位于 res/layout/ 目录下（不区分大小写）"""
+    path_lower = path.lower()
+    return '/res/layout/' in path_lower or '\\res\\layout\\' in path_lower
+
+def filter_xml_files(xml_files, xml_mode):
+    """根据模式过滤 XML 文件列表"""
+    if xml_mode == 'default':
+        return [f for f in xml_files if is_default_xml(f)]
+    elif xml_mode == 'layout':
+        return [f for f in xml_files if is_layout_xml(f) or is_default_xml(f)]
+    else:  # 'all'
+        return xml_files
+
+def process_input(input_path, output_dir, max_bytes,
+                  process_code, process_xml, xml_mode,
+                  process_pdf, process_word, use_ocr,
+                  custom_exts, log_callback, progress_callback, stop_flag):
     """主处理函数（后台线程）"""
     try:
         # 判断输入类型
@@ -201,7 +244,7 @@ def process_input(input_path, output_dir, max_bytes, process_code, process_json,
 
         # 分类
         code_files = []
-        json_files = []
+        xml_files = []
         pdf_files = []
         word_files = []
         custom_files = []
@@ -209,8 +252,8 @@ def process_input(input_path, output_dir, max_bytes, process_code, process_json,
             ext = os.path.splitext(path)[1].lower()
             if process_code and ext in CODE_EXTENSIONS:
                 code_files.append(path)
-            elif process_json and ext in JSON_EXTENSIONS:
-                json_files.append(path)
+            elif process_xml and ext in XML_EXTENSIONS:
+                xml_files.append(path)
             elif process_pdf and ext in PDF_EXTENSIONS:
                 pdf_files.append(path)
             elif process_word and ext in WORD_EXTENSIONS:
@@ -218,19 +261,24 @@ def process_input(input_path, output_dir, max_bytes, process_code, process_json,
             elif custom_exts and ext in custom_exts:
                 custom_files.append(path)
 
-        all_files = code_files + json_files + pdf_files + word_files + custom_files
+        # 应用 XML 模式过滤
+        xml_files = filter_xml_files(xml_files, xml_mode)
+
+        all_files = code_files + xml_files + pdf_files + word_files + custom_files
         if not all_files:
             log_callback("没有符合条件的文件")
             return
 
-        log_callback(f"扫描完成: 代码{len(code_files)}个, JSON{len(json_files)}个, PDF{len(pdf_files)}个, Word{len(word_files)}个, 自定义{len(custom_files)}个")
+        log_callback(f"扫描完成: 代码{len(code_files)}个, XML{len(xml_files)}个, PDF{len(pdf_files)}个, Word{len(word_files)}个, 自定义{len(custom_files)}个")
 
         # 生成目录树
         tree_str = get_tree_structure(file_paths)
 
-        # 输出文件基础名（改为 <项目名>-AI.txt）
+        # 输出文件基础名（<项目名>-AI.txt）-> 防重名处理
         base_name = os.path.splitext(os.path.basename(input_path))[0] or "project"
-        output_base = os.path.join(output_dir, f"{base_name}-AI.txt")
+        tentative_path = os.path.join(output_dir, f"{base_name}-AI.txt")
+        output_base = get_unique_filepath(tentative_path)   # 避免覆盖
+        log_callback(f"输出文件将保存为: {output_base}")
 
         # 写入器
         writer = SplitFileWriter(output_base, max_bytes)
@@ -285,9 +333,9 @@ def process_input(input_path, output_dir, max_bytes, process_code, process_json,
                 return "[无法读取]"
             write_section("代码文件内容", code_files, read_code)
 
-        # JSON文件
-        if json_files:
-            def read_json(path):
+        # XML 文件
+        if xml_files:
+            def read_xml(path):
                 if is_zip:
                     entry = next((e for e in entries if e.filename == path), None)
                     if entry:
@@ -299,7 +347,8 @@ def process_input(input_path, output_dir, max_bytes, process_code, process_json,
                             return f.read()
                     except:
                         return "[读取错误]"
-            write_section("JSON文件内容", json_files, read_json, 'json')
+                return "[无法读取]"
+            write_section("XML文件内容", xml_files, read_xml, 'xml')
 
         # PDF文件
         if pdf_files:
@@ -359,7 +408,7 @@ def process_input(input_path, output_dir, max_bytes, process_code, process_json,
 
         writer.close()
         log_callback(f"处理完成！输出文件: {output_base}" + (f" (及分卷)" if writer.part > 1 else ""))
-        return output_dir  # 返回输出目录，用于打开
+        return output_dir
 
     except Exception as e:
         log_callback(f"错误: {e}")
@@ -374,22 +423,23 @@ def process_input(input_path, output_dir, max_bytes, process_code, process_json,
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("项目代码处理器")
-        self.geometry("780x680")
+        self.title("项目代码处理器 - Android XML 优化版")
+        self.geometry("780x720")
         self.resizable(True, True)
 
         # 变量
-        self.input_type = tk.StringVar(value="zip")  # "zip" 或 "dir"
+        self.input_type = tk.StringVar(value="zip")
         self.input_path = tk.StringVar()
         self.output_dir = tk.StringVar(value=os.path.dirname(os.path.abspath(__file__)))
         self.split_mb = tk.IntVar(value=10)
         self.process_code = tk.BooleanVar(value=True)
-        self.process_json = tk.BooleanVar(value=False)   # JSON 默认不选
-        self.process_pdf = tk.BooleanVar(value=False)    # PDF 默认不选
-        self.process_word = tk.BooleanVar(value=False)   # Word 默认不选
+        self.process_xml = tk.BooleanVar(value=False)
+        self.xml_mode = tk.StringVar(value="default")
+        self.process_pdf = tk.BooleanVar(value=False)
+        self.process_word = tk.BooleanVar(value=False)
         self.use_ocr = tk.BooleanVar(value=False)
-        self.custom_exts = tk.StringVar()                # 用户自定义扩展名
-        self.auto_process = tk.BooleanVar(value=True)    # 自动处理，默认开启
+        self.custom_exts = tk.StringVar()
+        self.auto_process = tk.BooleanVar(value=True)
 
         self.stop_flag = threading.Event()
         self.thread = None
@@ -407,20 +457,18 @@ class App(tk.Tk):
         frame_input = tk.LabelFrame(self, text="输入源", padx=5, pady=5)
         frame_input.pack(fill='x', padx=10, pady=5)
 
-        # 类型选择
         type_frame = tk.Frame(frame_input)
         type_frame.pack(fill='x', pady=2)
         tk.Radiobutton(type_frame, text="ZIP 文件", variable=self.input_type, value="zip").pack(side='left', padx=5)
         tk.Radiobutton(type_frame, text="文件夹", variable=self.input_type, value="dir").pack(side='left', padx=5)
 
-        # 路径选择
         path_frame = tk.Frame(frame_input)
         path_frame.pack(fill='x', pady=2)
         self.input_entry = tk.Entry(path_frame, textvariable=self.input_path, width=50)
         self.input_entry.pack(side='left', fill='x', expand=True)
         tk.Button(path_frame, text="浏览...", command=self.browse_input).pack(side='right', padx=5)
 
-        # 输出目录（只读显示，但可手动修改）
+        # 输出目录
         frame_output = tk.LabelFrame(self, text="输出目录", padx=5, pady=5)
         frame_output.pack(fill='x', padx=10, pady=5)
         self.output_entry = tk.Entry(frame_output, textvariable=self.output_dir, width=50)
@@ -440,22 +488,30 @@ class App(tk.Tk):
         frame_options = tk.LabelFrame(self, text="处理选项", padx=5, pady=5)
         frame_options.pack(fill='x', padx=10, pady=5)
 
-        # 第一行：代码、JSON、PDF、Word
         row1 = tk.Frame(frame_options)
         row1.pack(fill='x', pady=2)
         tk.Checkbutton(row1, text="代码文件", variable=self.process_code).pack(side='left', padx=5)
-        tk.Checkbutton(row1, text="JSON文件", variable=self.process_json).pack(side='left', padx=5)
+        xml_frame = tk.Frame(row1)
+        xml_frame.pack(side='left', padx=5)
+        tk.Checkbutton(xml_frame, text="XML文件", variable=self.process_xml).pack(side='left')
+        self.xml_mode_combo = ttk.Combobox(xml_frame, textvariable=self.xml_mode, values=("default", "layout", "all"),
+                                           state="readonly", width=8)
+        self.xml_mode_combo.pack(side='left', padx=5)
+        self.xml_mode_label = tk.Label(row1, text="", fg="gray", font=("Arial", 8))
+        self.xml_mode_label.pack(side='left', padx=5)
+        self.update_xml_mode_label()
+        self.xml_mode.trace_add('write', lambda *a: self.update_xml_mode_label())
+
         tk.Checkbutton(row1, text="PDF文件", variable=self.process_pdf).pack(side='left', padx=5)
         tk.Checkbutton(row1, text="Word文件", variable=self.process_word).pack(side='left', padx=5)
 
-        # 第二行：OCR + 自定义扩展名
         row2 = tk.Frame(frame_options)
         row2.pack(fill='x', pady=2)
         tk.Checkbutton(row2, text="启用OCR (图片文字识别)", variable=self.use_ocr).pack(side='left', padx=5)
         tk.Label(row2, text="自定义扩展名 (逗号分隔，例如 .yml,.toml):").pack(side='left', padx=5)
         tk.Entry(row2, textvariable=self.custom_exts, width=30).pack(side='left', padx=5)
 
-        # 自动处理与手动按钮
+        # 控制按钮
         frame_control = tk.Frame(self)
         frame_control.pack(fill='x', padx=10, pady=5)
         self.auto_cb = tk.Checkbutton(frame_control, text="自动处理 (选择输入后立即开始)", variable=self.auto_process)
@@ -483,14 +539,19 @@ class App(tk.Tk):
         self.log_text = scrolledtext.ScrolledText(log_frame, height=12, state='normal')
         self.log_text.pack(fill='both', expand=True)
 
-        # 初始时禁止停止按钮
         self.update_ui_state()
-
-        # 绑定关闭事件，保存配置
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
 
+    def update_xml_mode_label(self):
+        mode = self.xml_mode.get()
+        texts = {
+            "default": "仅 activity_main.xml + AndroidManifest.xml",
+            "layout": "res/layout/ 下全部 XML + 默认文件",
+            "all": "项目中所有 .xml 文件"
+        }
+        self.xml_mode_label.config(text=texts.get(mode, ""))
+
     def browse_input(self):
-        """根据选择的类型打开文件/文件夹选择器"""
         if self.processing:
             messagebox.showinfo("提示", "正在处理中，请稍后...")
             return
@@ -500,13 +561,11 @@ class App(tk.Tk):
             path = filedialog.askdirectory()
         if path:
             self.input_path.set(path)
-            # 自动设置输出目录为输入源的父目录（ZIP文件）或目录本身（文件夹）
             if self.input_type.get() == "zip":
                 new_output = os.path.dirname(path)
             else:
                 new_output = path
             self.output_dir.set(new_output)
-            # 如果自动处理被勾选，立即开始处理
             if self.auto_process.get():
                 self.start_process()
 
@@ -531,11 +590,9 @@ class App(tk.Tk):
         self.update_idletasks()
 
     def update_ui_state(self):
-        """根据处理状态启用/禁用控件"""
         if self.processing:
             self.start_btn.config(state='disabled')
             self.stop_btn.config(state='normal')
-            # 输入相关控件可设置为只读
             self.input_entry.config(state='readonly')
             self.output_entry.config(state='readonly')
         else:
@@ -545,7 +602,6 @@ class App(tk.Tk):
             self.output_entry.config(state='normal')
 
     def start_process(self):
-        """开始处理（手动或自动触发）"""
         if self.processing:
             return
         input_path = self.input_path.get().strip()
@@ -554,18 +610,13 @@ class App(tk.Tk):
             return
         output_dir = self.output_dir.get().strip()
         if not output_dir:
-            # 如果输出目录为空，回退到脚本所在目录
             output_dir = os.path.dirname(os.path.abspath(__file__))
             self.output_dir.set(output_dir)
-
-        # 验证输入路径存在
         if not os.path.exists(input_path):
             messagebox.showerror("错误", "输入路径不存在")
             return
 
         max_bytes = self.split_mb.get() * 1024 * 1024 if self.split_mb.get() > 0 else 0
-
-        # 解析自定义扩展名
         custom_exts_str = self.custom_exts.get().strip()
         custom_exts = set()
         if custom_exts_str:
@@ -574,45 +625,36 @@ class App(tk.Tk):
                 if ext and ext.startswith('.'):
                     custom_exts.add(ext)
                 elif ext and not ext.startswith('.'):
-                    custom_exts.add('.' + ext)  # 自动补点
-                # 忽略空字符串
+                    custom_exts.add('.' + ext)
 
-        # 清空停止标志
         self.stop_flag.clear()
         self.processing = True
         self.update_ui_state()
-
-        # 重置进度
         self.progress_bar['value'] = 0
         self.detail_label.config(text="")
         self.log("开始处理...")
 
-        # 启动后台线程
         self.thread = threading.Thread(
             target=self.process_worker,
             args=(input_path, output_dir, max_bytes, custom_exts),
             daemon=True
         )
         self.thread.start()
-        # 监控线程结束
         self.after(100, self.check_thread)
 
     def process_worker(self, input_path, output_dir, max_bytes, custom_exts):
-        """后台处理函数"""
         result_dir = process_input(
             input_path, output_dir, max_bytes,
-            self.process_code.get(), self.process_json.get(),
+            self.process_code.get(), self.process_xml.get(), self.xml_mode.get(),
             self.process_pdf.get(), self.process_word.get(),
             self.use_ocr.get(),
             custom_exts,
             self.log, self.update_progress, self.stop_flag
         )
-        # 处理完成后，如果成功且没有停止，打开输出目录
         if result_dir and not self.stop_flag.is_set():
             self.open_folder(result_dir)
 
     def open_folder(self, folder):
-        """跨平台打开文件夹"""
         try:
             if sys.platform == 'win32':
                 os.startfile(folder)
@@ -636,18 +678,17 @@ class App(tk.Tk):
         self.log("正在停止...")
 
     def load_config(self):
-        """加载配置文件"""
         if os.path.exists(CONFIG_FILE):
             try:
                 with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
                     cfg = json.load(f)
-                # 恢复设置
                 self.input_type.set(cfg.get("input_type", "zip"))
                 self.input_path.set(cfg.get("input_path", ""))
                 self.output_dir.set(cfg.get("output_dir", os.path.dirname(os.path.abspath(__file__))))
                 self.split_mb.set(cfg.get("split_mb", 10))
                 self.process_code.set(cfg.get("process_code", True))
-                self.process_json.set(cfg.get("process_json", False))
+                self.process_xml.set(cfg.get("process_xml", False))
+                self.xml_mode.set(cfg.get("xml_mode", "default"))
                 self.process_pdf.set(cfg.get("process_pdf", False))
                 self.process_word.set(cfg.get("process_word", False))
                 self.use_ocr.set(cfg.get("use_ocr", False))
@@ -657,14 +698,14 @@ class App(tk.Tk):
                 print(f"加载配置失败: {e}")
 
     def save_config(self):
-        """保存配置到文件"""
         cfg = {
             "input_type": self.input_type.get(),
             "input_path": self.input_path.get(),
             "output_dir": self.output_dir.get(),
             "split_mb": self.split_mb.get(),
             "process_code": self.process_code.get(),
-            "process_json": self.process_json.get(),
+            "process_xml": self.process_xml.get(),
+            "xml_mode": self.xml_mode.get(),
             "process_pdf": self.process_pdf.get(),
             "process_word": self.process_word.get(),
             "use_ocr": self.use_ocr.get(),
@@ -678,7 +719,6 @@ class App(tk.Tk):
             print(f"保存配置失败: {e}")
 
     def on_closing(self):
-        """窗口关闭时保存配置"""
         self.save_config()
         self.destroy()
 
